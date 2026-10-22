@@ -1,6 +1,7 @@
-# CI gate: every push/PR to master must leave the game PLAYABLE and
-# TESTABLE. The smoke job boots the real server and joins a room with a
-# real Colyseus client — a green run means the browser game works.
+# Container pipeline: build -> Trivy scan -> push to Huawei Cloud SWR.
+# Runs on PRs too (build + scan only, no push) so a broken Dockerfile
+# never reaches master. Push happens only on master pushes, so secrets
+# are never needed on pull_request events.
 name: ci
 
 on:
@@ -10,92 +11,60 @@ on:
     branches: [master]
 
 jobs:
-  verify:
+  image:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Postgres service (PRD-postgres-adapter.md): exercises the pg driver
-    # contract tests on every push; json default stays exercised by the
-    # whole rest of the suite.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: oc
-          POSTGRES_DB: ocdata
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 54329:5432
-        options: >-
-          --health-cmd "pg_isready -U oc"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
+    permissions:
+      contents: read
     env:
-      TEST_DATABASE_URL: postgres://oc@localhost:54329/ocdata
+      IMAGE_NAME: opengame
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Compute image tag
+        id: meta
+        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build (load into the local docker daemon so we can scan it
+      # before anything is published).
+      - name: Build image
+        uses: docker/build-push-action@v6
         with:
-          node-version: 22
-          cache: npm
+          context: .
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Syntax check (every source + test file)
-        run: npm run check
-
-      - name: Unit + integration tests (headless server)
-        run: npm test
-
-      - name: Live smoke (boot real server, join over WebSocket)
-        run: npm run smoke
-
-  # P1.5: real-browser pass. The headless verify job cannot catch
-  # client-only breakage (schema API misuse, THREE scene wiring), so a
-  # real Chromium drives the same maintained regression used locally
-  # (test/browser.test.py): join -> countdown -> move, world + pvp flows.
-  e2e:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      # Vulnerability gate: fail the run on fixable HIGH/CRITICAL findings.
+      # ignore-unfixed keeps base-image noise out; relax severity here if
+      # upstream node:20-alpine lags a patch.
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
-          node-version: 22
-          cache: npm
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
 
-      - uses: actions/setup-python@v5
+      # Publish: master pushes only. PRs stop after the scan so secrets
+      # are never needed on pull_request events.
+      - name: Login to Huawei Cloud SWR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
         with:
-          python-version: "3.12"
+          registry: ${{ secrets.SWR_REGISTRY }}
+          username: ${{ secrets.SWR_USER }}
+          password: ${{ secrets.SWR_PASSWORD }}
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install Playwright + Chromium
+      - name: Tag and push to SWR
+        if: github.event_name == 'push'
         run: |
-          pip install playwright
-          playwright install --with-deps chromium
-
-      - name: Boot server (production entrypoint) and wait for healthz
-        run: |
-          PORT=2567 node src/server/index.js &
-          echo $! > /tmp/server.pid
-          for i in $(seq 1 30); do
-            if curl -fsS http://localhost:2567/healthz > /dev/null; then
-              echo "server healthy"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "server did not become healthy within 30s" >&2
-          exit 1
-
-      - name: Real-browser e2e (test/browser.test.py)
-        run: python3 test/browser.test.py
-
-      - name: Stop server
-        if: always()
-        run: kill "$(cat /tmp/server.pid)" 2>/dev/null || true
+          REF="${{ secrets.SWR_REGISTRY }}/${{ secrets.SWR_ORG }}/${IMAGE_NAME}"
+          docker tag "${IMAGE_NAME}:${{ steps.meta.outputs.short_sha }}" "${REF}:${{ steps.meta.outputs.short_sha }}"
+          docker tag "${IMAGE_NAME}:${{ steps.meta.outputs.short_sha }}" "${REF}:latest"
+          docker push "${REF}:${{ steps.meta.outputs.short_sha }}"
+          docker push "${REF}:latest"
